@@ -1,12 +1,12 @@
+# sensor.py
 import logging
 import requests
 import datetime
 from datetime import timedelta, timezone
 from datetime import datetime as dt_module
-import voluptuous as vol
 from dateutil import tz as dateutil_tz
 import os
-from homeassistant import config_entries
+import asyncio
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -17,11 +17,15 @@ from homeassistant.const import UnitOfEnergy, UnitOfPower, EVENT_HOMEASSISTANT_S
 from homeassistant.util import Throttle
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers import entity_registry as er
-from homeassistant.core import HomeAssistant, asyncio, CoreState
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant
 from homeassistant.components.recorder import DOMAIN as DOMAIN_RECORDER 
+from homeassistant.components import recorder
+from homeassistant.components.recorder.statistics import (
+    get_last_statistics,
+    async_add_external_statistics,
+)
 
-
+# Import your custom consts (must exist as in original integration)
 from .const import (
     DOMAIN, 
     TOKEN_URL,
@@ -59,7 +63,7 @@ from .const import (
 )
 
 MIN_TIME_BETWEEN_UPDATES = DEFAULT_SCAN_INTERVAL
-SCRIPT_VERSION = "1.1.17_cumulative_no_toplevel_last_reset" 
+SCRIPT_VERSION = "1.3.7_exclude_null_max"
 
 _LOGGER = logging.getLogger(__name__)
 DEBUG_PREFIX = f"[{DOMAIN.upper()}_DEBUG]" 
@@ -69,10 +73,10 @@ LOG_DIR = os.path.join(LOG_DIR_BASE, DOMAIN)
 LOG_FILE = os.path.join(LOG_DIR, f"{DOMAIN}.log") 
 
 try:
-    if not os.path.exists(LOG_DIR_BASE): 
-        os.makedirs(LOG_DIR_BASE)
+    if not os.path.exists(LOG_DIR_BASE):
+        os.makedirs(LOG_DIR_BASE, exist_ok=True)
     if not os.path.exists(LOG_DIR):
-        os.makedirs(LOG_DIR)
+        os.makedirs(LOG_DIR, exist_ok=True)
 
     file_handler = logging.FileHandler(LOG_FILE, mode='a')
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -90,11 +94,7 @@ except Exception as e_log_setup:
     _LOGGER.error(f"Error setting up dedicated file logger for {DOMAIN}: {e_log_setup}. Falling back to standard HA logging.", exc_info=True)
 
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    config_entry: config_entries.ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
+async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities):
     """Set up EGD-Distribuce24 sensors from a config entry."""
     _LOGGER.info(f"{DEBUG_PREFIX} async_setup_entry CALLED for {config_entry.title} (Script Version: {SCRIPT_VERSION})")
 
@@ -194,6 +194,7 @@ class EGDBaseSensor(SensorEntity):
         self._state: float | None = None
         self._attributes: dict[str, any] = {}
         self._last_reset_datetime_utc: dt_module | None = None 
+        self._last_processed_date: datetime.date | None = None
 
         self._attr_unique_id = f"{DOMAIN}_{self._ean}_{self._days_offset}_{self._api_profile.lower()}"
         day_desc_en = f"{self._days_offset}d ago (win {self._max_fetch_days}d)"
@@ -215,23 +216,40 @@ class EGDBaseSensor(SensorEntity):
             if event: 
                 _LOGGER.info(f"{DEBUG_PREFIX} Home Assistant started event received for {self.entity_id if self.entity_id else self.name}.")
             
+            # --- WAIT UNTIL HA IS RUNNING ---
+            while self.hass.state != "RUNNING":
+                _LOGGER.debug(f"{DEBUG_PREFIX} {self.name}: Waiting for Home Assistant state RUNNING (current: {self.hass.state})")
+                await asyncio.sleep(3)
+
+            # --- ENSURE WE WAIT FOR RECORDER TO BE AVAILABLE BEFORE IMPORT/WRITE ---
+            # Only perform initial wait once per integration instance to avoid delays for multiple entities
             if not self.hass.data[DOMAIN].get(delay_flag_name, False):
-                _LOGGER.info(f"{DEBUG_PREFIX} Performing one-time initial 30s delay before first {DOMAIN} sensor update for {self.name} to allow all services to register.")
-                await asyncio.sleep(30) 
+                _LOGGER.info(f"{DEBUG_PREFIX} Performing one-time initial recorder wait before first {DOMAIN} sensor update for {self.name} to allow recorder to register.")
+                # wait up to ~60s for recorder to show up (polling)
+                for _ in range(12):
+                    if DOMAIN_RECORDER in self.hass.config.components:
+                        _LOGGER.info(f"{DEBUG_PREFIX} Recorder component detected for {DOMAIN}. Proceeding with first update for {self.name}.")
+                        break
+                    _LOGGER.debug(f"{DEBUG_PREFIX} Recorder not found yet. Sleeping briefly before re-checking for {self.name}.")
+                    await asyncio.sleep(5)
+                else:
+                    _LOGGER.warning(f"{DEBUG_PREFIX} Recorder component ({DOMAIN_RECORDER}) not detected within wait timeout. First update will proceed, but statistics import might be skipped.")
                 self.hass.data[DOMAIN][delay_flag_name] = True
-                _LOGGER.info(f"{DEBUG_PREFIX} One-time initial 30s delay complete for {DOMAIN} sensors.")
+                _LOGGER.info(f"{DEBUG_PREFIX} One-time recorder wait complete for {DOMAIN} sensors.")
             else:
-                _LOGGER.info(f"{DEBUG_PREFIX} Initial 30s delay already performed this session for {DOMAIN}, proceeding with update for {self.name}.")
+                _LOGGER.info(f"{DEBUG_PREFIX} Initial recorder wait already performed this session for {DOMAIN}, proceeding with update for {self.name}.")
 
             if self.entity_id:
                 _LOGGER.info(f"{DEBUG_PREFIX} Scheduling first data update for {self.entity_id} ({self.name}) via async_update_ha_state(True)")
+                # Use async_create_task to schedule the update without blocking
                 self.hass.async_create_task(self.async_update_ha_state(True))
             else:
                 _LOGGER.warning(f"{DEBUG_PREFIX} {self.name} (UID: {self.unique_id}) cannot schedule first update directly after add: entity_id is STILL None. This is unexpected. Update will rely on polling interval.")
 
         if self.hass.state == "RUNNING":
             _LOGGER.info(f"{DEBUG_PREFIX} Home Assistant is already running (checked as string 'RUNNING') for {self.entity_id if self.entity_id else self.name}. Scheduling first update sequence.")
-            await _async_schedule_first_update()
+            # directly schedule the sequence
+            self.hass.async_create_task(_async_schedule_first_update())
         else:
             _LOGGER.info(f"{DEBUG_PREFIX} Home Assistant not fully started (state: {self.hass.state}) for {self.entity_id if self.entity_id else self.name}. Listening for EVENT_HOMEASSISTANT_START.")
             self.hass.bus.async_listen_once(
@@ -278,9 +296,9 @@ class EGDBaseSensor(SensorEntity):
 
     @property
     def last_reset(self) -> dt_module | None:
-        if self._target_unit == UnitOfEnergy.KILO_WATT_HOUR and self._target_state_class == SensorStateClass.TOTAL:
-             return None
-        if self._target_state_class == SensorStateClass.TOTAL or self._target_state_class == SensorStateClass.TOTAL_INCREASING:
+        # IMPORTANT: Home Assistant only allows last_reset for 'total' state_class.
+        # Return last_reset only for SensorStateClass.TOTAL to avoid HA ValueError.
+        if self._target_state_class == SensorStateClass.TOTAL:
             return self._last_reset_datetime_utc
         return None
 
@@ -300,43 +318,69 @@ class EGDBaseSensor(SensorEntity):
 
         access_token = self._get_access_token_from_api()
         if not access_token:
+            self._state = None
             self._attributes[ATTR_LAST_UPDATE_STATUS] = 'Token Retrieval Failed'
-            if self._target_unit == UnitOfEnergy.KILO_WATT_HOUR and self._target_state_class == SensorStateClass.TOTAL:
-                self._state = 0.0 
-                self._last_reset_datetime_utc = None 
-            else:
-                self._state = None
             _LOGGER.warning(f"{DEBUG_PREFIX} _PERFORM_UPDATE failed for {self.name} due to token retrieval failure.")
             return
+        
+        from homeassistant.util import dt as dt_util
+        from zoneinfo import ZoneInfo
+        import datetime
+        
+        # 1️⃣ Načti časovou zónu z HA (nebo fallback)
+        tz_name = getattr(self.hass.config, "time_zone", None) or "Europe/Prague"
+        tz = ZoneInfo(tz_name)
+        
+        # 2️⃣ Vypočítej půlnoc ručně podle lokální zóny
+        now_local = dt_util.now(tz)
+        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        midnight_utc = midnight_local.astimezone(datetime.timezone.utc)
+        
+        # 3️⃣ Ulož a loguj
+        self._last_reset_datetime_utc = midnight_utc
+        _LOGGER.info(
+            f"{DEBUG_PREFIX} Local midnight recalculated for {self.name}: "
+            f"{midnight_local.isoformat()} (UTC {midnight_utc.isoformat()})"
+        )
+
+        local_tz = tz
+        today_local = dt_util.now(local_tz).date()
+        
+        
+        last_key = f"{self.unique_id}_last_processed"
+        last_processed_date: datetime.date | None = self.hass.data[DOMAIN].get(last_key)
 
         data_found_for_any_day = False
-        day_start_for_stats_last_reset_utc = None # To store the actual start of day for metadata last_reset
         
         for i in range(self._max_fetch_days):
-            current_days_offset = self._days_offset + i
-            _LOGGER.info(f"{DEBUG_PREFIX} Attempting fetch for day offset: {current_days_offset} (Attempt {i+1}/{self._max_fetch_days}) for '{self.name}'")
+            target_date_local = today_local - timedelta(days=self._days_offset + i)
 
-            try:
-                local_tz = dateutil_tz.gettz(TIMEZONE_PRAGUE)
-                if not local_tz:
-                    _LOGGER.warning(f"{DEBUG_PREFIX} Timezone '{TIMEZONE_PRAGUE}' not found, using system's local timezone for '{self.name}'.")
-                    local_tz = dt_util.now().tzinfo
-                
-                now_in_local_tz = dt_util.now(local_tz)
-                target_date_local = now_in_local_tz - timedelta(days=current_days_offset)
-                
-                period_start_local = target_date_local.replace(hour=0, minute=0, second=0, microsecond=0)
-                period_end_local = target_date_local.replace(hour=23, minute=45, second=0, microsecond=0) 
-                day_start_for_stats_last_reset_utc = period_start_local.astimezone(timezone.utc)
-
-
-            except Exception as e_time:
-                _LOGGER.error(f"{DEBUG_PREFIX} Error calculating time period for offset {current_days_offset} for '{self.name}': {e_time}", exc_info=True)
+            # skip today's date (we want only complete past days)
+            if target_date_local >= today_local:
                 continue
+
+            # if already processed this or earlier date, skip
+            if last_processed_date and target_date_local <= last_processed_date:
+                continue
+
+            period_start_local = datetime.datetime.combine(
+                target_date_local, datetime.time.min, tzinfo=local_tz
+            )
+            period_end_local = datetime.datetime.combine(
+                target_date_local, datetime.time(23, 45), tzinfo=local_tz
+            )
+
+            processed_data = self._fetch_and_process_data_for_day(
+                access_token, period_start_local, period_end_local, target_date_local
+            )
             
-            _LOGGER.info(f"{DEBUG_PREFIX} Calling _fetch_and_process_data_for_day for {self.name}, date {target_date_local.strftime('%Y-%m-%d')}")
-            processed_data = self._fetch_and_process_data_for_day(access_token, period_start_local, period_end_local, target_date_local)
-            _LOGGER.info(f"{DEBUG_PREFIX} _fetch_and_process_data_for_day returned for {self.name}. Data found: {processed_data.get('data_found')}")
+            # --- SAFETY CHECK: skip import if all interval values are zero or None ---
+            if not processed_data or all((v == 0 or v is None) for v in processed_data.values()):
+                _LOGGER.warning(
+                    f"{DEBUG_PREFIX} STATISTICS IMPORT SKIPPED for {self.entity_id}: "
+                    f"All interval values are zero for {target_date}."
+                )
+                return 
             
             if processed_data["data_found"]:
                 _LOGGER.info(f"{DEBUG_PREFIX} Data found for {self.name} for date {target_date_local.strftime('%Y-%m-%d')}. Processing...")
@@ -344,10 +388,12 @@ class EGDBaseSensor(SensorEntity):
                 if self._target_unit == UnitOfEnergy.KILO_WATT_HOUR and self._target_state_class == SensorStateClass.TOTAL:
                     self._attributes["daily_total_kwh"] = processed_data["total_kwh_for_day"]
                     self._state = 0.0 
-                    self._last_reset_datetime_utc = None 
-                    _LOGGER.info(f"{DEBUG_PREFIX} For energy sensor {self.name}, main state set to {self._state}, daily_total_kwh attribute: {self._attributes['daily_total_kwh']}, main last_reset: None")
+                    # For SensorStateClass.TOTAL we return last_reset (already set above to local midnight UTC)
+                    _LOGGER.info(f"{DEBUG_PREFIX} For energy sensor {self.name}, main state set to {self._state}, daily_total_kwh attribute: {self._attributes['daily_total_kwh']}, main last_reset: {self._last_reset_datetime_utc}")
                 elif self._target_state_class == SensorStateClass.TOTAL_INCREASING: 
-                    self._state = processed_data["total_kwh_for_day"] 
+                    self._state = None 
+                    # last_reset is stored internally but NOT returned to HA unless state_class == TOTAL
+                    # store it for internal diagnostics and logging
                     self._last_reset_datetime_utc = period_start_local.astimezone(timezone.utc)
                 elif self._target_state_class == SensorStateClass.MEASUREMENT: 
                     if processed_data["detailed_intervals"]:
@@ -360,7 +406,20 @@ class EGDBaseSensor(SensorEntity):
                 data_found_for_any_day = True
 
                 # --- Import statistics logic ---
-                if self.entity_id and self._target_unit == UnitOfEnergy.KILO_WATT_HOUR and processed_data.get("detailed_intervals"):
+                if not processed_data.get("data_found") or not processed_data.get("detailed_intervals"):
+                    _LOGGER.warning(f"{DEBUG_PREFIX} STATISTICS IMPORT SKIPPED for {self.entity_id}: No data found from API for {target_date_local.strftime('%Y-%m-%d')}")
+                    continue
+                intervals = processed_data.get("detailed_intervals", [])
+                if not processed_data.get("data_found") or not intervals:
+                    _LOGGER.warning(f"{DEBUG_PREFIX} STATISTICS IMPORT SKIPPED for {self.entity_id}: No data found from API.")
+                    continue
+                
+                # ✅ new check
+                if all((i.get("value") or 0) == 0 for i in intervals):
+                    _LOGGER.warning(f"{DEBUG_PREFIX} STATISTICS IMPORT SKIPPED for {self.entity_id}: All interval values are zero for {target_date_local.strftime('%Y-%m-%d')}.")
+                    continue
+                
+                if self.entity_id and self._target_unit == UnitOfEnergy.KILO_WATT_HOUR:
                     _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT (v{SCRIPT_VERSION}): Starting for {self.entity_id} for date {target_date_local.strftime('%Y-%m-%d')}")
                     
                     recorder_loaded = DOMAIN_RECORDER in self.hass.config.components
@@ -377,8 +436,8 @@ class EGDBaseSensor(SensorEntity):
                         else:
                             _LOGGER.warning(f"{DEBUG_PREFIX} STATISTICS IMPORT: Domain '{DOMAIN_RECORDER}' not found in hass.services.async_services().")
                     else: 
+                        # Build hourly deltas from 15-minute intervals
                         hourly_aggregated_data = {} 
-                        
                         for interval_data in processed_data.get("detailed_intervals", []):
                             try:
                                 api_timestamp_utc_str = interval_data.get('timestamp_utc')
@@ -392,8 +451,9 @@ class EGDBaseSensor(SensorEntity):
                                 
                                 interval_kwh = float(interval_kwh_raw)
 
+                                # Safety: for consumption ensure non-negative
                                 if self._api_profile == PROFILE_CONSUMPTION_ENERGY and interval_kwh < 0:
-                                    _LOGGER.error(f"{DEBUG_PREFIX} STATISTICS IMPORT CRITICAL: Negative kWh value ({interval_kwh}) from API for CONSUMPTION profile {self.name} at {interval_end_utc.isoformat()}. Using 0 for sum.")
+                                    _LOGGER.error(f"{DEBUG_PREFIX} STATISTICS IMPORT CRITICAL: Negative kWh value ({interval_kwh}) from API for CONSUMPTION profile {self.name} at {interval_end_utc.isoformat()}. Using 0 for delta.")
                                     interval_kwh = 0.0 
 
                                 hourly_aggregated_data.setdefault(hour_bucket_start_utc, 0.0)
@@ -403,53 +463,101 @@ class EGDBaseSensor(SensorEntity):
                         
                         _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: Initial hourly aggregated data (deltas) for {self.entity_id}: {hourly_aggregated_data}")
                         
-                        stats_payload_list = []
-                        current_day_cumulative_sum = 0.0
+                        # --- 1️⃣ Zjisti poslední kumulativní hodnotu z databáze ---
+                        cumulative_sum = 0.0
+                        last_start = None
+                        try:
+                            # We're already running inside an executor thread (self._perform_update), so call the blocking
+                            # get_last_statistics() directly — this is safe here and avoids any asyncio loop hustle.
+                            last_stats = get_last_statistics(self.hass, 1, self.entity_id, True, {"sum","start_ts"})
+                            if last_stats and self.entity_id in last_stats:
+                                last_record = last_stats[self.entity_id][0]
+                                last_start = dt_module.fromtimestamp(last_record.get("start_ts"), tz=timezone.utc) if last_record.get("start_ts") else None
+                                cumulative_sum = float(last_record.get("sum", 0.0) or 0.0)
+                                _LOGGER.info(f"{DEBUG_PREFIX} Found previous cumulative sum={cumulative_sum} last_start={last_start.isoformat()}, for {self.entity_id}")
+                            else:
+                                _LOGGER.info(f"{DEBUG_PREFIX} No previous statistics found for {self.entity_id}, starting from 0.0")
+                        except Exception as e:
+                            _LOGGER.warning(f"{DEBUG_PREFIX} Could not read previous statistics: {e}")
+    
+                        # Determine local-day UTC start and end for the target local date
+                        local_tz = dateutil_tz.gettz(TIMEZONE_PRAGUE) or dt_util.now().tzinfo
+                        day_start_local = datetime.datetime.combine(target_date_local, datetime.time.min, tzinfo=local_tz)
+                        day_start_utc = day_start_local.astimezone(dateutil_tz.tzutc())
+                        # Build list of hourly buckets for the local day expressed in UTC
+                        hours_for_day = [day_start_utc + timedelta(hours=h) for h in range(0, 24)]
                         
-                        sorted_hours = sorted(hourly_aggregated_data.keys())
+                        stats_payload_list = []
+                        daily_sum = 0.0
+                        
+                        # --- NEW: determine baseline (first value of the day) ---
+                        non_zero_values = [v for v in hourly_aggregated_data.values() if isinstance(v, (int, float)) and v != 0]
+                        baseline_offset = min(non_zero_values) if non_zero_values else 0.0
+                        if baseline_offset != 0.0:
+                            _LOGGER.debug(f"{DEBUG_PREFIX} STATISTICS IMPORT: Baseline offset detected for {self.entity_id}: {baseline_offset:.3f} kWh – adjusting to start from zero.")
+                        
+                        for hour_start_dt in hours_for_day:
+                            delta = max(0.0, hourly_aggregated_data.get(hour_start_dt, 0.0) - baseline_offset)
+                            daily_sum += delta
+                            if last_start == None or last_start < hour_start_dt:
+                                cumulative_sum += delta
+                            else:
+                                _LOGGER.warning(
+                                    f"{DEBUG_PREFIX} skipped: last_start={last_start.isoformat()} < start={hour_start_dt.isoformat()}")
+                                continue
 
-                        for hour_start_dt in sorted_hours:
-                            hourly_kwh_delta_val = round(hourly_aggregated_data[hour_start_dt], 3)
-                            current_day_cumulative_sum += hourly_kwh_delta_val
-                            current_day_cumulative_sum = round(current_day_cumulative_sum, 3) 
-                            
-                            if self._api_profile == PROFILE_CONSUMPTION_ENERGY and current_day_cumulative_sum < 0: # Should not happen if deltas are positive
-                                _LOGGER.error(f"{DEBUG_PREFIX} STATISTICS IMPORT CRITICAL: Cumulative sum for CONSUMPTION {self.name} became negative ({current_day_cumulative_sum}) at hour {hour_start_dt.isoformat()}. Using previous sum or delta if first.")
-                                # Revert to previous cumulative sum or just the delta if this is the first problematic one
-                                current_day_cumulative_sum -= hourly_kwh_delta_val # back out the problematic delta
-                                current_day_cumulative_sum = round(max(0, current_day_cumulative_sum), 3) # Ensure not negative
-                                # Add only if delta itself was positive
-                                if hourly_kwh_delta_val > 0:
-                                    current_day_cumulative_sum += hourly_kwh_delta_val
-                                current_day_cumulative_sum = round(current_day_cumulative_sum, 3)
-
+                            # daily_sum = round(daily_sum, 4)
+                            # cumulative_sum = round(cumulative_sum, 4)
 
                             stats_payload_list.append({
-                                "start": hour_start_dt.isoformat(), 
-                                "sum": current_day_cumulative_sum, 
-                                "max": current_day_cumulative_sum, 
+                                "start": hour_start_dt.isoformat(),
+                                "state": float(round(daily_sum, 4)),   # denní přírůstek
+                                "sum": float(round(cumulative_sum, 4)), # celkový kumulativní
                             })
-                        if stats_payload_list:
-                            _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: Final CUMULATIVE stats_payload_list for {self.entity_id} (first 3 items): {stats_payload_list[:3]}")
-                            
-                            current_source = "recorder" 
-                            
+                            _LOGGER.warning(
+                                f"{DEBUG_PREFIX} WRITE hourly: start={hour_start_dt.isoformat()} "
+                                f"state(daily)={daily_sum} sum(accumulated)={cumulative_sum}"
+                            )
+
+
+                        # --- 4️⃣ Uzávěrka dne ---
+                        # midnight_next_utc = (day_start_utc + timedelta(days=1))
+                        # stats_payload_list.append({
+                        #     "start": midnight_next_utc.isoformat(),
+                        #     "state": float(daily_sum),
+                        #     "sum": float(cumulative_sum),
+                        # })
+                        # _LOGGER.warning(
+                        #     f"{DEBUG_PREFIX} WRITE final: start={midnight_next_utc.isoformat()} "
+                        #     f"state(daily)={daily_sum} sum(accumulated)={cumulative_sum}"
+                        # )
+
+                        # Final filter: exclude any stats where max is None OR not numeric
+                        cleaned_stats = []
+                        skipped_invalid = 0
+                        for s in stats_payload_list:
+                            if s.get("sum") is None or not isinstance(s.get("sum"), (int, float)):
+                                skipped_invalid += 1
+                                continue
+                            cleaned_stats.append(s)
+
+                        _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: Prepared {len(cleaned_stats)} hourly cumulative records for {self.entity_id} (skipped {skipped_invalid} invalid). Reset at local midnight (UTC): {day_start_utc.isoformat()}. Total sum: {cumulative_sum} kWh")
+                        
+                        if cleaned_stats:
                             service_call_payload = {
                                 "statistic_id": self.entity_id,
-                                "source": current_source,
-                                "has_mean": False, 
-                                "has_sum": True,   
-                                "stats": stats_payload_list,
-                                # "last_reset": day_start_for_stats_last_reset_utc.isoformat() if day_start_for_stats_last_reset_utc else None 
-                                # Keep top-level last_reset removed as it caused schema errors
+                                "source": "recorder",
+                                "has_mean": False,
+                                "has_sum": True,
+                                "stats": cleaned_stats,
                             }
                             if hasattr(self, '_attr_name') and self._attr_name:
                                 service_call_payload["name"] = self._attr_name
                             if self.unit_of_measurement:
                                 service_call_payload["unit_of_measurement"] = self.unit_of_measurement
-                            
-                            _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: Calling {DOMAIN_RECORDER}.import_statistics for {self.entity_id}. Source: '{current_source}'. Payload (sample): {str(service_call_payload)[:500]}...")
-                            
+
+                            _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: Calling {DOMAIN_RECORDER}.import_statistics for {self.entity_id}. Payload sample (first 3): {str(service_call_payload['stats'][:3])} ...")
+                            # schedule the service call on the event loop
                             service_coro = self.hass.services.async_call(DOMAIN_RECORDER, "import_statistics", service_call_payload)
                             self.hass.loop.call_soon_threadsafe(
                                self.hass.async_create_task,
@@ -457,43 +565,23 @@ class EGDBaseSensor(SensorEntity):
                             )
                             _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: Service call to {DOMAIN_RECORDER}.import_statistics scheduled for {self.entity_id}.")
                         else:
-                            _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: No hourly statistics to import for {self.entity_id} for date {target_date_local.strftime('%Y-%m-%d')}.")
+                            _LOGGER.info(f"{DEBUG_PREFIX} STATISTICS IMPORT: No valid hourly statistics to import for {self.entity_id} for date {target_date_local.strftime('%Y-%m-%d')}.")
                 elif not self.entity_id and self._target_unit == UnitOfEnergy.KILO_WATT_HOUR and processed_data.get("detailed_intervals"):
                     _LOGGER.warning(f"{DEBUG_PREFIX} Cannot import statistics for {self.name}: entity_id is still not available in _perform_update.")
 
-                _LOGGER.info(f"{DEBUG_PREFIX} _PERFORM_UPDATE: Data found for {self.name}, breaking fetch loop.")
+                # mark this date as processed
+                self.hass.data[DOMAIN][last_key] = target_date_local
+                _LOGGER.info(
+                    f"{DEBUG_PREFIX} Successfully imported data for day {target_date_local}, next run will start with the following day."
+                )
                 break 
             else:
                 _LOGGER.info(f"{DEBUG_PREFIX} No data found for '{self.name}' for date {target_date_local.strftime('%Y-%m-%d')}. Status: {processed_data.get('attributes_to_set', {}).get(ATTR_LAST_UPDATE_STATUS)}")
                 self._attributes[ATTR_LAST_UPDATE_STATUS] = processed_data["attributes_to_set"].get(ATTR_LAST_UPDATE_STATUS, "Fetch Failed")
 
-        if not data_found_for_any_day:
-            _LOGGER.warning(f"{DEBUG_PREFIX} No data found for '{self.name}' within the {self._max_fetch_days}-day fetch window (primary offset {self._days_offset}).")
-            if self._target_unit == UnitOfEnergy.KILO_WATT_HOUR and self._target_state_class == SensorStateClass.TOTAL:
-                self._state = 0.0 
-                self._last_reset_datetime_utc = None
-            elif self._target_state_class == SensorStateClass.TOTAL:
-                self._state = 0.0
-            else: 
-                self._state = None
-            
-            self._attributes[ATTR_LAST_UPDATE_STATUS] = f'No data in {self._max_fetch_days}-day window'
-            self._attributes[ATTR_FIFTEEN_MINUTE_DATA] = []
-            self._attributes[ATTR_API_DATA_POINTS_RECEIVED] = 0
-            self._attributes[ATTR_DATA_FETCHED_FOR_DATE_LOCAL] = "N/A (No data in window)"
-            if not (self._target_unit == UnitOfEnergy.KILO_WATT_HOUR and self._target_state_class == SensorStateClass.TOTAL):
-                if self._target_state_class == SensorStateClass.TOTAL:
-                    try: 
-                        local_tz = dateutil_tz.gettz(TIMEZONE_PRAGUE) or dt_util.now().tzinfo
-                        now_in_local_tz = dt_util.now(local_tz)
-                        primary_target_date_local = now_in_local_tz - timedelta(days=self._days_offset)
-                        self._last_reset_datetime_utc = primary_target_date_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(dateutil_tz.tzutc())
-                    except Exception:
-                        self._last_reset_datetime_utc = None
-                else:
-                    self._last_reset_datetime_utc = None
-        
-        _LOGGER.info(f"{DEBUG_PREFIX} _PERFORM_UPDATE finished for {self.name}. Final state: {self._state}, Last Status: {self._attributes.get(ATTR_LAST_UPDATE_STATUS)}")
+        # if no state set -> provide informative last update status
+        if not self._state:
+            self._attributes[ATTR_LAST_UPDATE_STATUS] = f"No complete day data in {self._max_fetch_days}-day window"
 
 
     def _get_access_token_from_api(self) -> str | None:
@@ -648,7 +736,8 @@ class EGDEnergyConsumptionSensor(EGDBaseSensor):
                          PROFILE_CONSUMPTION_ENERGY, f"Consumption Energy ({PROFILE_CONSUMPTION_ENERGY})", entry_id,
                          is_value_direct_kwh=True,
                          target_unit=UnitOfEnergy.KILO_WATT_HOUR,
-                         target_state_class=SensorStateClass.TOTAL_INCREASING)
+                         target_state_class=SensorStateClass.TOTAL_INCREASING
+                         )
 
 class EGDEnergyProductionSensor(EGDBaseSensor):
     """Sensor for EGD energy production (ISQ2 - kWh)."""
@@ -658,7 +747,8 @@ class EGDEnergyProductionSensor(EGDBaseSensor):
                          PROFILE_PRODUCTION_ENERGY, f"Production Energy ({PROFILE_PRODUCTION_ENERGY})", entry_id,
                          is_value_direct_kwh=True,
                          target_unit=UnitOfEnergy.KILO_WATT_HOUR,
-                         target_state_class=SensorStateClass.TOTAL_INCREASING)
+                         target_state_class=SensorStateClass.TOTAL_INCREASING
+                         )
 
 
 class EGDStatusSensor(SensorEntity):
